@@ -151,6 +151,7 @@ func (cfg *config) start1(i int) {
 	applyCh := make(chan ApplyMsg)
 	go func() {
 		for m := range applyCh {
+			Logf(INFO, "%v applyMsg %v\n", i, m)
 			err_msg := ""
 			if m.UseSnapshot {
 				// ignore the snapshot
@@ -206,7 +207,7 @@ func (cfg *config) cleanup() {
 
 // attach server i to the net.
 func (cfg *config) connect(i int) {
-	// fmt.Printf("connect(%d)\n", i)
+	Logf(INFO, "connect(%d)\n", i)
 
 	cfg.connected[i] = true
 
@@ -229,7 +230,7 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	// fmt.Printf("disconnect(%d)\n", i)
+	Logf(INFO, "disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
 
@@ -387,6 +388,7 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // as do the threads that read from applyCh.
 // returns index.
 func (cfg *config) one(cmd int, expectedServers int) int {
+	num := 0
 	t0 := time.Now()
 	starts := 0
 	for time.Since(t0).Seconds() < 10 {
@@ -410,11 +412,18 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 		}
 
 		if index != -1 {
+			num = 0
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+
+				if nd != num {
+					num = nd
+					Logf(INFO, "%v/%v committed for index %v\n", nd, expectedServers, index)
+				}
+
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd2, ok := cmd1.(int); ok && cmd2 == cmd {

@@ -17,13 +17,47 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"fmt"
+	"labrpc"
+	"math/rand"
+	"os"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "encoding/gob"
+const (
+	DEBUG = 0
+	INFO  = 1
+	WARN  = 2
+	ERROR = 3
+)
 
+var logLevel int
 
+func Logf(level int, fmtstr string, args ...interface{}) {
+	if level >= logLevel {
+		fmt.Printf(fmtstr, args...)
+	}
+}
+
+func init() {
+	logLevel = WARN
+	if val, ok := os.LookupEnv("LOG_LEVEL"); ok {
+		switch val {
+		case "DEBUG":
+			logLevel = DEBUG
+		case "INFO":
+			logLevel = INFO
+		case "WARN":
+			logLevel = WARN
+		case "ERROR":
+			logLevel = ERROR
+		}
+	}
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -35,6 +69,30 @@ type ApplyMsg struct {
 	Command     interface{}
 	UseSnapshot bool   // ignore for lab2; only used in lab3
 	Snapshot    []byte // ignore for lab2; only used in lab3
+}
+
+type VotedForType struct {
+	voted bool
+	Id    int
+}
+
+const (
+	STATE_FOLLOWER  = iota
+	STATE_CANDIDATE // also known as candidate state
+	STATE_LEADER
+)
+
+const RaftRetryGracePeriod = 100 * time.Millisecond
+const RaftHeartBeatPeriod = 100 * time.Millisecond
+
+const RaftElectionTimeoutMin = 150 // Millisecond, inclusive
+const RaftElectionTimeoutMax = 300 // exclusive
+
+const RaftHeartBeatTimeout = 1 * time.Second
+
+type LogEntry struct {
+	Command interface{}
+	Term    int
 }
 
 //
@@ -50,6 +108,29 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent states
+	currentTerm int
+	votedFor    VotedForType
+	log         []LogEntry
+
+	// Volatile states
+	commitIndex int
+	lastApplied int
+
+	// leader-only states
+	nextIndex  []int
+	matchIndex []int
+
+	// follower-only states
+	lastHeartBeat time.Time
+
+	// other stuff
+	state           int
+	candPeerVote    []bool
+	candVotes       int
+	electionTimeout time.Duration
+	applyCh         chan ApplyMsg
+	peerSynced      []bool // eligible for scheduling
 }
 
 // return currentTerm and whether this server
@@ -59,6 +140,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.state == STATE_LEADER
+	Logf(DEBUG, "%v get state term=%v isleader=%v\n", rf.me, term, isleader)
+
 	return term, isleader
 }
 
@@ -93,8 +180,80 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
 
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
 
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	refusal := AppendEntriesReply{
+		Term:    rf.currentTerm,
+		Success: false,
+	}
+
+	grant := AppendEntriesReply{
+		Term:    rf.currentTerm,
+		Success: true,
+	}
+
+	if args.Term < rf.currentTerm {
+		Logf(DEBUG, "%v REFUSES stale append from %v (arg=%v, cur=%v)\n", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+		*reply = refusal
+		return
+	}
+
+	rf.updateTerm(args.Term)
+	rf.lastHeartBeat = time.Now()
+
+	// Append log
+	// This is skipped by heart beat and LeaderCommit update entries
+	if !(len(rf.log) > args.PrevLogIndex && (args.PrevLogIndex == -1 || rf.log[args.PrevLogIndex].Term == args.PrevLogTerm)) {
+		// Leader needs to pick an earlier index
+		*reply = refusal
+		return
+	}
+	// TODO this is the lazy way, also means we lose logs uncessarily
+	// if there's nothing new
+	if len(args.Entries) > 0 {
+		rf.log = append(rf.log[0:args.PrevLogIndex+1], args.Entries...)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		lastLogIndex := len(rf.log) - 1
+		if lastLogIndex < args.LeaderCommit {
+			rf.updateCommitIndex(lastLogIndex)
+		} else {
+			rf.updateCommitIndex(args.LeaderCommit)
+		}
+	}
+	*reply = grant
+	return
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok {
+		return ok
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.updateTerm(reply.Term)
+	return ok
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -102,6 +261,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -110,6 +273,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -117,6 +282,63 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.updateTerm(args.Term)
+
+	refusal := RequestVoteReply{
+		Term:        rf.currentTerm,
+		VoteGranted: false,
+	}
+	grant := RequestVoteReply{
+		Term:        rf.currentTerm,
+		VoteGranted: true,
+	}
+
+	// Stale requests
+	if args.Term < rf.currentTerm {
+		Logf(DEBUG, "%v refuses stale requests from %v\n", rf.me, args.CandidateId)
+		*reply = refusal
+		return
+	}
+
+	// Note on followers
+	// They will NOT vote for anybody else once they have voted
+	// They will only transit to voting mode when not receiving heartbeats
+
+	// A new candidate is valid if it has a more up to date log
+	// 1. The log is of a newer term
+	// 2. The log is of the same term, but has more entries
+	grantVote := false
+	if rf.votedFor.voted == false {
+		lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
+		if (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
+			// This *might* be redundant
+			// The paper mentions that valid requests from candidates can
+			// keep the follower in follower mode, I'm guessing this is
+			// what they mean by a valid request
+			rf.lastHeartBeat = time.Now()
+			grantVote = true
+		} else {
+			Logf(INFO, "%v refuses vote from %v (log check)\n", rf.me, args.CandidateId)
+			Logf(INFO, "\targs.LastLogTerm=%v lastLogTerm=%v\n", args.LastLogTerm, lastLogTerm)
+			Logf(INFO, "\targs.LastLogIndex=%v lastLogIndex=%v\n", args.LastLogTerm, lastLogIndex)
+		}
+	} else if rf.votedFor.Id == args.CandidateId {
+		grantVote = true
+	}
+
+	if grantVote {
+		rf.votedFor.voted = true
+		rf.votedFor.Id = args.CandidateId
+
+		*reply = grant
+		return
+	}
+	Logf(DEBUG, "%v REFUSES vote from %v\n", rf.me, args.CandidateId)
+	*reply = refusal
+	return
 }
 
 //
@@ -153,7 +375,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -173,9 +394,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	index = len(rf.log)
+	term = rf.currentTerm
+	isLeader = rf.state == STATE_LEADER
+
+	if isLeader {
+		rf.AppendLog(LogEntry{
+			Command: command,
+			Term:    rf.currentTerm,
+		})
+	}
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) AppendLog(entry LogEntry) {
+	rf.scheduleUpdatePeerLog()
+	rf.log = append(rf.log, entry)
 }
 
 //
@@ -186,6 +424,351 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+}
+
+func (rf *Raft) genElectionTimeout() time.Duration {
+	r := RaftElectionTimeoutMax - RaftElectionTimeoutMin
+	rf.electionTimeout = time.Duration(RaftElectionTimeoutMin+rand.Int()%r) * time.Millisecond
+	return rf.electionTimeout
+}
+
+func (rf *Raft) becomeCandidate() {
+	Logf(INFO, "%v -> CANDIDATE\n", rf.me)
+	rf.state = STATE_CANDIDATE
+
+	// TODO Persistence
+	rf.currentTerm += 1
+	Logf(DEBUG, "%v increases term to %v\n", rf.me, rf.currentTerm)
+	rf.votedFor.voted = true
+	rf.votedFor.Id = rf.me
+
+	// Volatile states
+	rf.candPeerVote = make([]bool, len(rf.peers))
+	rf.candPeerVote[rf.me] = true // just for the heck of it
+	rf.candVotes = 1
+	rf.genElectionTimeout()
+
+	go func(term int) {
+		rf.mu.Lock()
+		timeout := rf.electionTimeout
+		rf.mu.Unlock()
+
+		time.Sleep(timeout)
+
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.state == STATE_CANDIDATE && rf.currentTerm == term {
+			// Restart candidacy
+			Logf(INFO, "%v candidacy timeout\n", rf.me)
+			rf.becomeCandidate()
+		}
+	}(rf.currentTerm)
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go rf.requestVoteAndUpdate(i)
+		}
+	}
+}
+
+func (rf *Raft) becomeLeader() {
+	Logf(INFO, "%v -> LEADER\n", rf.me)
+	rf.state = STATE_LEADER
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.peerSynced = make([]bool, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.peerSynced[i] = true
+		if i != rf.me {
+			rf.nextIndex[i] = len(rf.log)
+			rf.matchIndex[i] = 0
+		}
+	}
+	rf.scheduleUpdatePeerLog()
+	rf.ScheduleTick()
+}
+
+func (rf *Raft) becomeFollower() {
+	Logf(INFO, "%v -> FOLLOWER\n", rf.me)
+	rf.votedFor.voted = false
+	rf.state = STATE_FOLLOWER
+	rf.genElectionTimeout()
+	rf.lastHeartBeat = time.Now() // dunno about this
+
+	rf.ScheduleTick()
+}
+
+func (rf *Raft) lastLogIndexTerm() (int, int) {
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.log[lastLogIndex].Term
+	}
+	return lastLogIndex, lastLogTerm
+}
+
+func (rf *Raft) requestVoteAndUpdate(peerIndex int) {
+	var reply RequestVoteReply
+
+	rf.mu.Lock()
+
+	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+	curTerm := rf.currentTerm
+
+	rf.mu.Unlock()
+
+	ok := rf.sendRequestVote(peerIndex, &args, &reply)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if !(curTerm == rf.currentTerm && rf.state == STATE_CANDIDATE) {
+		return
+	}
+
+	if !ok {
+		go func() {
+			time.Sleep(RaftHeartBeatPeriod)
+			rf.requestVoteAndUpdate(peerIndex)
+		}()
+		return
+	}
+
+	rf.updateTerm(reply.Term)
+	if rf.state != STATE_CANDIDATE {
+		return
+	}
+
+	if reply.VoteGranted {
+		if !rf.candPeerVote[peerIndex] {
+			rf.candVotes += 1
+			rf.candPeerVote[peerIndex] = true
+			if rf.candVotes > len(rf.candPeerVote)/2 {
+				rf.becomeLeader()
+				return
+			}
+		}
+	}
+}
+
+func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
+	// This method recursive:
+	// updatePeerLog -> reply (success) -> leader updates -> updatePeerLog ...
+	//               \-> reply (fail) -> heartbeat period -> updatePeerLog
+
+	// To avoid goroutine leak when state changes from
+	// Leader (old term) -> Follower -> Leader (new term)
+	// we need to invalidate this if our term doesn't match anymore
+
+	Logf(INFO, "%v waking up\n", peerIndex)
+	defer Logf(INFO, "%v sleeping\n", peerIndex)
+
+	rf.mu.Lock()
+
+	if !(rf.currentTerm == routineTerm && rf.state == STATE_LEADER) {
+		rf.mu.Unlock()
+		return
+	}
+
+	prevLogIndex := -1
+	prevLogTerm := 0
+
+	// Send empty log when we need to update LeaderCommit
+	entries := []LogEntry{}
+	if rf.nextIndex[peerIndex] < len(rf.log) {
+		entries = rf.log[rf.nextIndex[peerIndex]:]
+	}
+	if rf.nextIndex[peerIndex] > 0 {
+		prevLogIndex = rf.nextIndex[peerIndex] - 1
+		prevLogTerm = rf.log[prevLogIndex].Term
+	}
+
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+
+	rf.mu.Unlock()
+
+	var reply AppendEntriesReply
+
+	// The way this function is written is vulnerable to arbitrarily long
+	// network latency, hence the timer. We need to ensure that nodes
+	// exchange messages at a rate approximately the heartbeat period
+
+	doneCh := make(chan int)
+	expireCh := make(chan int)
+
+	var sendok bool
+	var ok bool
+	go func() {
+		sendok = rf.sendAppendEntries(peerIndex, &args, &reply)
+		doneCh <- 1
+	}()
+
+	go func() {
+		time.Sleep(RaftHeartBeatPeriod * 2)
+		expireCh <- 1
+	}()
+
+	select {
+	case _ = <-doneCh:
+		go func() { <-expireCh }()
+		ok = sendok
+	case _ = <-expireCh:
+		go func() { <-doneCh }()
+		ok = false
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	me := rf.me
+
+	// updateTerm demoted us or this goroutine is stale
+	if !(rf.currentTerm == routineTerm && rf.state == STATE_LEADER) {
+		return
+	}
+
+	if !ok {
+		// Retry at heartbeat interval
+		Logf(INFO, "%v retrying %v\n", me, peerIndex)
+		go func() {
+			time.Sleep(RaftHeartBeatPeriod)
+			rf.updatePeerLog(routineTerm, peerIndex)
+		}()
+		return
+	}
+
+	if !reply.Success {
+		// Retry with smaller nextIndex
+		rf.nextIndex[peerIndex] -= 1
+
+		if rf.nextIndex[peerIndex] < 0 {
+			panic(fmt.Sprintf("%v's nextIndex for %v is negative", rf.me, peerIndex))
+		}
+		go rf.updatePeerLog(routineTerm, peerIndex)
+		return
+	}
+
+	rf.nextIndex[peerIndex] += len(args.Entries)
+	rf.matchIndex[peerIndex] = rf.nextIndex[peerIndex] - 1
+
+	// commit index changed, notify all peers
+	changed := rf.findNewCommitIndex()
+	if changed {
+		rf.peerSynced[peerIndex] = true // schedule this too
+		rf.scheduleUpdatePeerLog()
+		return
+	}
+
+	// only notify this peer
+	if rf.nextIndex[peerIndex] < len(rf.log) || rf.commitIndex > args.LeaderCommit {
+		go rf.updatePeerLog(routineTerm, peerIndex)
+		return
+	}
+	rf.peerSynced[peerIndex] = true
+}
+
+func (rf *Raft) scheduleUpdatePeerLog() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me && rf.peerSynced[i] {
+			rf.peerSynced[i] = false
+			go rf.updatePeerLog(rf.currentTerm, i)
+		}
+	}
+}
+
+func (rf *Raft) majorityPersisted(index int) bool {
+	nPersisted := 1
+	for i := 0; i < len(rf.matchIndex); i++ {
+		if i != rf.me && rf.matchIndex[i] >= index {
+			nPersisted += 1
+			if nPersisted > len(rf.peers)/2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (rf *Raft) findNewCommitIndex() bool {
+	changed := false
+	for i := rf.commitIndex + 1; i < len(rf.log); i++ {
+		if rf.majorityPersisted(i) {
+			Logf(INFO, "%v.commits(%v)\n", rf.me, i)
+			rf.updateCommitIndex(i)
+			changed = true
+		} else {
+			break
+		}
+	}
+	return changed
+}
+
+func (rf *Raft) updateCommitIndex(index int) {
+	oldIndex := rf.commitIndex
+	Logf(INFO, "%v.updateCommitIndex(%v -> %v: %v)\n", rf.me, oldIndex+1, index, rf.log[oldIndex+1:index+1])
+	rf.commitIndex = index
+	for i := oldIndex + 1; i <= rf.commitIndex; i++ {
+		msg := ApplyMsg{
+			Index:   i,
+			Command: rf.log[i].Command,
+		}
+		rf.applyCh <- msg
+	}
+}
+
+func (rf *Raft) _tick() {
+	switch rf.state {
+	case STATE_FOLLOWER:
+		{
+			now := time.Now()
+			if now.Sub(rf.lastHeartBeat) > rf.electionTimeout {
+				rf.becomeCandidate()
+				return
+			}
+		}
+	case STATE_CANDIDATE:
+		// do nothing
+	case STATE_LEADER:
+		// acts as heart beat
+		rf.scheduleUpdatePeerLog()
+	default:
+		panic("Shouldn't happen")
+	}
+	rf.ScheduleTick()
+}
+
+func (rf *Raft) ScheduleTick() {
+	go func() {
+		time.Sleep(RaftHeartBeatPeriod)
+		rf.Tick()
+	}()
+}
+
+func (rf *Raft) Tick() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf._tick()
+}
+
+func (rf *Raft) updateTerm(term int) {
+	if term > rf.currentTerm {
+		Logf(DEBUG, "%v updates term from %v to %v\n", rf.me, rf.currentTerm, term)
+		rf.currentTerm = term
+		rf.becomeFollower()
+	}
 }
 
 //
@@ -207,10 +790,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.applyCh = applyCh
+	rf.log = make([]LogEntry, 0)
+	rf.becomeFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
