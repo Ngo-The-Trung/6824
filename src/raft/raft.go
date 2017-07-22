@@ -109,9 +109,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Persistent states
-	currentTerm int
-	votedFor    VotedForType
-	log         []LogEntry
+	CurrentTerm int
+	VotedFor    VotedForType
+	Log         []LogEntry
 
 	// Volatile states
 	commitIndex int
@@ -133,7 +133,7 @@ type Raft struct {
 	peerSynced      []bool // eligible for scheduling
 }
 
-// return currentTerm and whether this server
+// return CurrentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
@@ -142,7 +142,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term = rf.currentTerm
+	term = rf.CurrentTerm
 	isleader = rf.state == STATE_LEADER
 	Logf(DEBUG, "%v get state term=%v isleader=%v\n", rf.me, term, isleader)
 
@@ -200,17 +200,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	refusal := AppendEntriesReply{
-		Term:    rf.currentTerm,
+		Term:    rf.CurrentTerm,
 		Success: false,
 	}
 
 	grant := AppendEntriesReply{
-		Term:    rf.currentTerm,
+		Term:    rf.CurrentTerm,
 		Success: true,
 	}
 
-	if args.Term < rf.currentTerm {
-		Logf(DEBUG, "%v REFUSES stale append from %v (arg=%v, cur=%v)\n", rf.me, args.LeaderId, args.Term, rf.currentTerm)
+	if args.Term < rf.CurrentTerm {
+		Logf(DEBUG, "%v REFUSES stale append from %v (arg=%v, cur=%v)\n", rf.me, args.LeaderId, args.Term, rf.CurrentTerm)
 		*reply = refusal
 		return
 	}
@@ -220,7 +220,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Append log
 	// This is skipped by heart beat and LeaderCommit update entries
-	if !(len(rf.log) > args.PrevLogIndex && (args.PrevLogIndex == -1 || rf.log[args.PrevLogIndex].Term == args.PrevLogTerm)) {
+	if !(len(rf.Log) > args.PrevLogIndex && (args.PrevLogIndex == -1 || rf.Log[args.PrevLogIndex].Term == args.PrevLogTerm)) {
 		// Leader needs to pick an earlier index
 		*reply = refusal
 		return
@@ -228,11 +228,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// TODO this is the lazy way, also means we lose logs uncessarily
 	// if there's nothing new
 	if len(args.Entries) > 0 {
-		rf.log = append(rf.log[0:args.PrevLogIndex+1], args.Entries...)
+		rf.Log = append(rf.Log[0:args.PrevLogIndex+1], args.Entries...)
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
-		lastLogIndex := len(rf.log) - 1
+		lastLogIndex := len(rf.Log) - 1
 		if lastLogIndex < args.LeaderCommit {
 			rf.updateCommitIndex(lastLogIndex)
 		} else {
@@ -288,16 +288,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.updateTerm(args.Term)
 
 	refusal := RequestVoteReply{
-		Term:        rf.currentTerm,
+		Term:        rf.CurrentTerm,
 		VoteGranted: false,
 	}
 	grant := RequestVoteReply{
-		Term:        rf.currentTerm,
+		Term:        rf.CurrentTerm,
 		VoteGranted: true,
 	}
 
 	// Stale requests
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.CurrentTerm {
 		Logf(DEBUG, "%v refuses stale requests from %v\n", rf.me, args.CandidateId)
 		*reply = refusal
 		return
@@ -311,7 +311,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 1. The log is of a newer term
 	// 2. The log is of the same term, but has more entries
 	grantVote := false
-	if rf.votedFor.voted == false {
+	if rf.VotedFor.voted == false {
 		lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
 		if (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			// This *might* be redundant
@@ -325,13 +325,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			Logf(INFO, "\targs.LastLogTerm=%v lastLogTerm=%v\n", args.LastLogTerm, lastLogTerm)
 			Logf(INFO, "\targs.LastLogIndex=%v lastLogIndex=%v\n", args.LastLogTerm, lastLogIndex)
 		}
-	} else if rf.votedFor.Id == args.CandidateId {
+	} else if rf.VotedFor.Id == args.CandidateId {
 		grantVote = true
 	}
 
 	if grantVote {
-		rf.votedFor.voted = true
-		rf.votedFor.Id = args.CandidateId
+		rf.VotedFor.voted = true
+		rf.VotedFor.Id = args.CandidateId
 
 		*reply = grant
 		return
@@ -397,14 +397,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index = len(rf.log)
-	term = rf.currentTerm
+	index = len(rf.Log)
+	term = rf.CurrentTerm
 	isLeader = rf.state == STATE_LEADER
 
 	if isLeader {
 		rf.AppendLog(LogEntry{
 			Command: command,
-			Term:    rf.currentTerm,
+			Term:    rf.CurrentTerm,
 		})
 	}
 
@@ -413,7 +413,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) AppendLog(entry LogEntry) {
 	rf.scheduleUpdatePeerLog()
-	rf.log = append(rf.log, entry)
+	rf.Log = append(rf.Log, entry)
 }
 
 //
@@ -437,10 +437,10 @@ func (rf *Raft) becomeCandidate() {
 	rf.state = STATE_CANDIDATE
 
 	// TODO Persistence
-	rf.currentTerm += 1
-	Logf(DEBUG, "%v increases term to %v\n", rf.me, rf.currentTerm)
-	rf.votedFor.voted = true
-	rf.votedFor.Id = rf.me
+	rf.CurrentTerm += 1
+	Logf(DEBUG, "%v increases term to %v\n", rf.me, rf.CurrentTerm)
+	rf.VotedFor.voted = true
+	rf.VotedFor.Id = rf.me
 
 	// Volatile states
 	rf.candPeerVote = make([]bool, len(rf.peers))
@@ -457,12 +457,12 @@ func (rf *Raft) becomeCandidate() {
 
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		if rf.state == STATE_CANDIDATE && rf.currentTerm == term {
+		if rf.state == STATE_CANDIDATE && rf.CurrentTerm == term {
 			// Restart candidacy
 			Logf(INFO, "%v candidacy timeout\n", rf.me)
 			rf.becomeCandidate()
 		}
-	}(rf.currentTerm)
+	}(rf.CurrentTerm)
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -480,7 +480,7 @@ func (rf *Raft) becomeLeader() {
 	for i := 0; i < len(rf.peers); i++ {
 		rf.peerSynced[i] = true
 		if i != rf.me {
-			rf.nextIndex[i] = len(rf.log)
+			rf.nextIndex[i] = len(rf.Log)
 			rf.matchIndex[i] = 0
 		}
 	}
@@ -490,7 +490,7 @@ func (rf *Raft) becomeLeader() {
 
 func (rf *Raft) becomeFollower() {
 	Logf(INFO, "%v -> FOLLOWER\n", rf.me)
-	rf.votedFor.voted = false
+	rf.VotedFor.voted = false
 	rf.state = STATE_FOLLOWER
 	rf.genElectionTimeout()
 	rf.lastHeartBeat = time.Now() // dunno about this
@@ -499,10 +499,10 @@ func (rf *Raft) becomeFollower() {
 }
 
 func (rf *Raft) lastLogIndexTerm() (int, int) {
-	lastLogIndex := len(rf.log) - 1
+	lastLogIndex := len(rf.Log) - 1
 	lastLogTerm := 0
 	if lastLogIndex >= 0 {
-		lastLogTerm = rf.log[lastLogIndex].Term
+		lastLogTerm = rf.Log[lastLogIndex].Term
 	}
 	return lastLogIndex, lastLogTerm
 }
@@ -514,12 +514,12 @@ func (rf *Raft) requestVoteAndUpdate(peerIndex int) {
 
 	lastLogIndex, lastLogTerm := rf.lastLogIndexTerm()
 	args := RequestVoteArgs{
-		Term:         rf.currentTerm,
+		Term:         rf.CurrentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
-	curTerm := rf.currentTerm
+	curTerm := rf.CurrentTerm
 
 	rf.mu.Unlock()
 
@@ -528,7 +528,7 @@ func (rf *Raft) requestVoteAndUpdate(peerIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if !(curTerm == rf.currentTerm && rf.state == STATE_CANDIDATE) {
+	if !(curTerm == rf.CurrentTerm && rf.state == STATE_CANDIDATE) {
 		return
 	}
 
@@ -571,7 +571,7 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 
 	rf.mu.Lock()
 
-	if !(rf.currentTerm == routineTerm && rf.state == STATE_LEADER) {
+	if !(rf.CurrentTerm == routineTerm && rf.state == STATE_LEADER) {
 		rf.mu.Unlock()
 		return
 	}
@@ -581,16 +581,16 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 
 	// Send empty log when we need to update LeaderCommit
 	entries := []LogEntry{}
-	if rf.nextIndex[peerIndex] < len(rf.log) {
-		entries = rf.log[rf.nextIndex[peerIndex]:]
+	if rf.nextIndex[peerIndex] < len(rf.Log) {
+		entries = rf.Log[rf.nextIndex[peerIndex]:]
 	}
 	if rf.nextIndex[peerIndex] > 0 {
 		prevLogIndex = rf.nextIndex[peerIndex] - 1
-		prevLogTerm = rf.log[prevLogIndex].Term
+		prevLogTerm = rf.Log[prevLogIndex].Term
 	}
 
 	args := AppendEntriesArgs{
-		Term:         rf.currentTerm,
+		Term:         rf.CurrentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
@@ -636,7 +636,7 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 	me := rf.me
 
 	// updateTerm demoted us or this goroutine is stale
-	if !(rf.currentTerm == routineTerm && rf.state == STATE_LEADER) {
+	if !(rf.CurrentTerm == routineTerm && rf.state == STATE_LEADER) {
 		return
 	}
 
@@ -673,7 +673,7 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 	}
 
 	// only notify this peer
-	if rf.nextIndex[peerIndex] < len(rf.log) || rf.commitIndex > args.LeaderCommit {
+	if rf.nextIndex[peerIndex] < len(rf.Log) || rf.commitIndex > args.LeaderCommit {
 		go rf.updatePeerLog(routineTerm, peerIndex)
 		return
 	}
@@ -684,7 +684,7 @@ func (rf *Raft) scheduleUpdatePeerLog() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me && rf.peerSynced[i] {
 			rf.peerSynced[i] = false
-			go rf.updatePeerLog(rf.currentTerm, i)
+			go rf.updatePeerLog(rf.CurrentTerm, i)
 		}
 	}
 }
@@ -704,7 +704,7 @@ func (rf *Raft) majorityPersisted(index int) bool {
 
 func (rf *Raft) findNewCommitIndex() bool {
 	changed := false
-	for i := rf.commitIndex + 1; i < len(rf.log); i++ {
+	for i := rf.commitIndex + 1; i < len(rf.Log); i++ {
 		if rf.majorityPersisted(i) {
 			Logf(INFO, "%v.commits(%v)\n", rf.me, i)
 			rf.updateCommitIndex(i)
@@ -718,12 +718,12 @@ func (rf *Raft) findNewCommitIndex() bool {
 
 func (rf *Raft) updateCommitIndex(index int) {
 	oldIndex := rf.commitIndex
-	Logf(INFO, "%v.updateCommitIndex(%v -> %v: %v)\n", rf.me, oldIndex+1, index, rf.log[oldIndex+1:index+1])
+	Logf(INFO, "%v.updateCommitIndex(%v -> %v: %v)\n", rf.me, oldIndex+1, index, rf.Log[oldIndex+1:index+1])
 	rf.commitIndex = index
 	for i := oldIndex + 1; i <= rf.commitIndex; i++ {
 		msg := ApplyMsg{
 			Index:   i,
-			Command: rf.log[i].Command,
+			Command: rf.Log[i].Command,
 		}
 		rf.applyCh <- msg
 	}
@@ -764,9 +764,9 @@ func (rf *Raft) Tick() {
 }
 
 func (rf *Raft) updateTerm(term int) {
-	if term > rf.currentTerm {
-		Logf(DEBUG, "%v updates term from %v to %v\n", rf.me, rf.currentTerm, term)
-		rf.currentTerm = term
+	if term > rf.CurrentTerm {
+		Logf(DEBUG, "%v updates term from %v to %v\n", rf.me, rf.CurrentTerm, term)
+		rf.CurrentTerm = term
 		rf.becomeFollower()
 	}
 }
@@ -791,7 +791,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.applyCh = applyCh
-	rf.log = make([]LogEntry, 0)
+	rf.Log = make([]LogEntry, 0)
 	rf.becomeFollower()
 
 	// initialize from state persisted before a crash
