@@ -164,7 +164,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.Log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	Logf(INFO, "%v.persist() -> Term=%v VotedFor=%v Log=%v\n", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
+	// Logf(INFO, "%v.persist() -> Term=%v VotedFor=%v Log=%v\n", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
 	// Logf(INFO, "Data = %v\n", data)
 }
 
@@ -180,7 +180,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.CurrentTerm)
 	d.Decode(&rf.VotedFor)
 	d.Decode(&rf.Log)
-	Logf(INFO, "%v.readPersist() -> Term=%v VotedFor=%v Log=%v\n", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
+	// Logf(INFO, "%v.readPersist() -> Term=%v VotedFor=%v Log=%v\n", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
 	// Logf(INFO, "Data = %v\n", data)
 }
 
@@ -229,12 +229,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		*reply = refusal
 		return
 	}
-	// TODO this is the lazy way, also means we lose logs uncessarily
-	// if there's nothing new
-	if len(args.Entries) > 0 {
-		rf.Log = append(rf.Log[0:args.PrevLogIndex+1], args.Entries...)
-		rf.persist()
+
+	for i, entry := range args.Entries {
+		index := i + args.PrevLogIndex + 1
+		if index >= len(rf.Log) {
+			rf.Log = append(rf.Log, entry)
+		} else if entry.Term != rf.Log[index].Term {
+			rf.Log[index] = entry
+			rf.Log = rf.Log[0 : index+1]
+		}
 	}
+	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex {
 		lastLogIndex := len(rf.Log) - 1
