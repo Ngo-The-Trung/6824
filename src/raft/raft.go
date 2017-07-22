@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"labrpc"
 	"math/rand"
@@ -155,29 +157,31 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.Log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	Logf(INFO, "%v.persist() -> Term=%v VotedFor=%v Log=%v\n", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
+	// Logf(INFO, "Data = %v\n", data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.CurrentTerm)
+	d.Decode(&rf.VotedFor)
+	d.Decode(&rf.Log)
+	Logf(INFO, "%v.readPersist() -> Term=%v VotedFor=%v Log=%v\n", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
+	// Logf(INFO, "Data = %v\n", data)
 }
 
 type AppendEntriesArgs struct {
@@ -229,6 +233,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// if there's nothing new
 	if len(args.Entries) > 0 {
 		rf.Log = append(rf.Log[0:args.PrevLogIndex+1], args.Entries...)
+		rf.persist()
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -332,6 +337,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if grantVote {
 		rf.VotedFor.voted = true
 		rf.VotedFor.Id = args.CandidateId
+		rf.persist()
 
 		*reply = grant
 		return
@@ -402,7 +408,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.state == STATE_LEADER
 
 	if isLeader {
-		rf.AppendLog(LogEntry{
+		rf.LeaderAppendLog(LogEntry{
 			Command: command,
 			Term:    rf.CurrentTerm,
 		})
@@ -411,9 +417,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-func (rf *Raft) AppendLog(entry LogEntry) {
+func (rf *Raft) LeaderAppendLog(entry LogEntry) {
 	rf.scheduleUpdatePeerLog()
 	rf.Log = append(rf.Log, entry)
+	rf.persist()
 }
 
 //
@@ -436,11 +443,12 @@ func (rf *Raft) becomeCandidate() {
 	Logf(INFO, "%v -> CANDIDATE\n", rf.me)
 	rf.state = STATE_CANDIDATE
 
-	// TODO Persistence
 	rf.CurrentTerm += 1
-	Logf(DEBUG, "%v increases term to %v\n", rf.me, rf.CurrentTerm)
 	rf.VotedFor.voted = true
 	rf.VotedFor.Id = rf.me
+	rf.persist()
+
+	Logf(DEBUG, "%v increases term to %v\n", rf.me, rf.CurrentTerm)
 
 	// Volatile states
 	rf.candPeerVote = make([]bool, len(rf.peers))
@@ -491,6 +499,7 @@ func (rf *Raft) becomeLeader() {
 func (rf *Raft) becomeFollower() {
 	Logf(INFO, "%v -> FOLLOWER\n", rf.me)
 	rf.VotedFor.voted = false
+	rf.persist() // TODO srsly
 	rf.state = STATE_FOLLOWER
 	rf.genElectionTimeout()
 	rf.lastHeartBeat = time.Now() // dunno about this
@@ -566,8 +575,8 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 	// Leader (old term) -> Follower -> Leader (new term)
 	// we need to invalidate this if our term doesn't match anymore
 
-	Logf(INFO, "%v waking up\n", peerIndex)
-	defer Logf(INFO, "%v sleeping\n", peerIndex)
+	Logf(DEBUG, "%v waking up\n", peerIndex)
+	defer Logf(DEBUG, "%v sleeping\n", peerIndex)
 
 	rf.mu.Lock()
 
@@ -767,6 +776,7 @@ func (rf *Raft) updateTerm(term int) {
 	if term > rf.CurrentTerm {
 		Logf(DEBUG, "%v updates term from %v to %v\n", rf.me, rf.CurrentTerm, term)
 		rf.CurrentTerm = term
+		rf.persist()
 		rf.becomeFollower()
 	}
 }
@@ -790,12 +800,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.applyCh = applyCh
-	rf.Log = make([]LogEntry, 0)
-	rf.becomeFollower()
-
-	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.applyCh = applyCh
+	rf.becomeFollower()
 
 	return rf
 }
