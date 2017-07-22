@@ -84,13 +84,10 @@ const (
 	STATE_LEADER
 )
 
-const RaftRetryGracePeriod = 100 * time.Millisecond
-const RaftHeartBeatPeriod = 100 * time.Millisecond
+const RaftHeartBeatPeriod = 50 * time.Millisecond
 
 const RaftElectionTimeoutMin = 150 // Millisecond, inclusive
 const RaftElectionTimeoutMax = 300 // exclusive
-
-const RaftHeartBeatTimeout = 1 * time.Second
 
 type LogEntry struct {
 	Command interface{}
@@ -128,8 +125,9 @@ type Raft struct {
 
 	// other stuff
 	state           int
-	candPeerVote    []bool
+	candPeerVote    []bool // TODO this is redundant now that I only use one goroutine per peer
 	candVotes       int
+	candRefusals    int
 	electionTimeout time.Duration
 	applyCh         chan ApplyMsg
 	peerSynced      []bool // eligible for scheduling
@@ -459,6 +457,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.candPeerVote = make([]bool, len(rf.peers))
 	rf.candPeerVote[rf.me] = true // just for the heck of it
 	rf.candVotes = 1
+	rf.candRefusals = 0
 	rf.genElectionTimeout()
 
 	go func(term int) {
@@ -470,11 +469,17 @@ func (rf *Raft) becomeCandidate() {
 
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		if rf.state == STATE_CANDIDATE && rf.CurrentTerm == term {
-			// Restart candidacy
-			Logf(INFO, "%v candidacy timeout\n", rf.me)
-			rf.becomeCandidate()
+
+		if !(rf.state == STATE_CANDIDATE && rf.CurrentTerm == term) {
+			return
 		}
+		if rf.candRefusals > len(rf.peers)/2 {
+			Logf(INFO, "%v is unable to become leader grants=%v refusals=%v\n", rf.me, rf.candVotes, rf.candRefusals)
+			return
+		}
+		// Restart candidacy
+		Logf(INFO, "%v candidacy timeout grants=%v refusals=%v\n", rf.me, rf.candVotes, rf.candRefusals)
+		rf.becomeCandidate()
 	}(rf.CurrentTerm)
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -568,10 +573,12 @@ func (rf *Raft) requestVoteAndUpdate(peerIndex int) {
 				return
 			}
 		}
+	} else {
+		rf.candRefusals += 1
 	}
 }
 
-func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
+func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int, retries int) {
 	// This method recursive:
 	// updatePeerLog -> reply (success) -> leader updates -> updatePeerLog ...
 	//               \-> reply (fail) -> heartbeat period -> updatePeerLog
@@ -620,25 +627,22 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 	// network latency, hence the timer. We need to ensure that nodes
 	// exchange messages at a rate approximately the heartbeat period
 
-	doneCh := make(chan int)
+	doneCh := make(chan bool)
 	expireCh := make(chan int)
 
-	var sendok bool
 	var ok bool
 	go func() {
-		sendok = rf.sendAppendEntries(peerIndex, &args, &reply)
-		doneCh <- 1
+		doneCh <- rf.sendAppendEntries(peerIndex, &args, &reply)
 	}()
 
 	go func() {
-		time.Sleep(RaftHeartBeatPeriod * 2)
+		time.Sleep(RaftHeartBeatPeriod)
 		expireCh <- 1
 	}()
 
 	select {
-	case _ = <-doneCh:
+	case ok = <-doneCh:
 		go func() { <-expireCh }()
-		ok = sendok
 	case _ = <-expireCh:
 		go func() { <-doneCh }()
 		ok = false
@@ -656,10 +660,14 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 
 	if !ok {
 		// Retry at heartbeat interval
-		Logf(INFO, "%v retrying %v\n", me, peerIndex)
+		duration := RaftHeartBeatPeriod * time.Duration(retries)
+		Logf(INFO, "%v will retry %v after %v\n", me, peerIndex, duration)
 		go func() {
-			time.Sleep(RaftHeartBeatPeriod)
-			rf.updatePeerLog(routineTerm, peerIndex)
+			time.Sleep(duration)
+			if retries < 32 {
+				retries *= 2
+			}
+			rf.updatePeerLog(routineTerm, peerIndex, retries)
 		}()
 		return
 	}
@@ -671,7 +679,7 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 		if rf.nextIndex[peerIndex] < 0 {
 			panic(fmt.Sprintf("%v's nextIndex for %v is negative", rf.me, peerIndex))
 		}
-		go rf.updatePeerLog(routineTerm, peerIndex)
+		go rf.updatePeerLog(routineTerm, peerIndex, 1)
 		return
 	}
 
@@ -688,7 +696,7 @@ func (rf *Raft) updatePeerLog(routineTerm int, peerIndex int) {
 
 	// only notify this peer
 	if rf.nextIndex[peerIndex] < len(rf.Log) || rf.commitIndex > args.LeaderCommit {
-		go rf.updatePeerLog(routineTerm, peerIndex)
+		go rf.updatePeerLog(routineTerm, peerIndex, 1)
 		return
 	}
 	rf.peerSynced[peerIndex] = true
@@ -698,7 +706,7 @@ func (rf *Raft) scheduleUpdatePeerLog() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me && rf.peerSynced[i] {
 			rf.peerSynced[i] = false
-			go rf.updatePeerLog(rf.CurrentTerm, i)
+			go rf.updatePeerLog(rf.CurrentTerm, i, 1)
 		}
 	}
 }
